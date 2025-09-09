@@ -105,45 +105,34 @@ var ClientCmd = &cobra.Command{
 		if err != nil {
 			log.Fatalf("failed to parse client address: %v", err)
 		}
+	
+		// Keep original host for localhost UDP
+		if host == "127.0.0.1" || host == "localhost" {
+			log.Printf("[CLIENT] Using localhost (%s) for UDP communication", host)
+		}
 
 		fmt.Printf("[CLIENT] starting... host=%s ports=%v\n", host, ports)
 		metrics.PromActivePorts.Set(float64(len(ports)))
 
-		receiver, err := udp.NewMultiUDPReceiver(host, ports, 1000000)
+		receiver, err := udp.NewMultiUDPReceiver(host, ports, 10000000)
 		if err != nil {
 			log.Fatalf("failed to create multi UDP receiver: %v", err)
 		}
 		defer receiver.Close()
 
-		// Establish RETX connection immediately
+		log.Printf("[CLIENT] UDP receiver created successfully for %v", ports)
+		log.Printf("[CLIENT] Packet channel capacity: %d", cap(receiver.Packets()))
+
+		// RETX connection variables - will be initialized after first UDP packet
 		var ctrlConn net.Conn
 		var ctrlEnc *json.Encoder
 		var retxEnabled bool
+		var firstPacketReceived bool
 
-		// Function to attempt RETX connection
-		attemptRetxConnection := func() {
-			if retxEnabled {
-				return // Already connected
-			}
-			conn, err := net.Dial("tcp", clientCtrl)
-			if err != nil {
-				utils.DebugLog("RETX connection attempt failed: %v", err)
-				return
-			}
-			ctrlConn = conn
-			ctrlEnc = json.NewEncoder(ctrlConn)
-			retxEnabled = true
-			utils.DebugLog("[CLIENT] RETX connection established")
-		}
+		// Declare function variable (will be assigned after rb is created)
+		var attemptRetxConnection func()
 
-		// Try to establish RETX connection at startup
-		go attemptRetxConnection()
-
-		defer func() {
-			if ctrlConn != nil {
-				ctrlConn.Close()
-			}
-		}()
+		// Control connection cleanup will be handled when connection is established
 
 		var out io.Writer
 		if outputFile == "-" {
@@ -165,18 +154,26 @@ var ClientCmd = &cobra.Command{
 		}
 
 		rb := buffer.NewReorderBuffer(out, time.Duration(retxTimeoutMs)*time.Millisecond, func(chunkID uint64, missing []uint32) {
-			// Always try to establish/re-establish connection for each RETX request
+			log.Printf("[CLIENT] RETX: Callback triggered for chunk %d, missing packets: %v", chunkID, missing)
+			// Establish RETX connection on first use (after receiving first UDP packet)
+			if !firstPacketReceived {
+				log.Printf("[CLIENT] ERROR: RETX requested before first UDP packet received! Chunk: %d, missing: %v", chunkID, missing)
+				return
+			}
+
 			if !retxEnabled || ctrlConn == nil || ctrlEnc == nil {
+				log.Printf("[CLIENT] RETX: Connection not ready (enabled=%v, conn=%v, enc=%v), attempting to connect...", retxEnabled, ctrlConn != nil, ctrlEnc != nil)
 				attemptRetxConnection()
 				// Give it more time to connect
 				time.Sleep(100 * time.Millisecond)
+				log.Printf("[CLIENT] RETX: After connection attempt - enabled=%v, conn=%v, enc=%v", retxEnabled, ctrlConn != nil, ctrlEnc != nil)
 			}
 			if ctrlEnc == nil {
-				utils.DebugLog("RETX not available - control connection failed")
+				log.Printf("[CLIENT] ERROR: RETX not available - control connection failed for chunk %d", chunkID)
 				return
 			}
 			if err := ctrlEnc.Encode(map[string]any{"type": "retx", "chunk": chunkID, "missing": missing}); err != nil {
-				utils.DebugLog("failed to send retx request: %v", err)
+				log.Printf("[CLIENT] ERROR: Failed to send RETX request for chunk %d: %v", chunkID, err)
 				// Reset connection on error
 				if ctrlConn != nil {
 					ctrlConn.Close()
@@ -185,27 +182,42 @@ var ClientCmd = &cobra.Command{
 					retxEnabled = false
 				}
 			} else {
-				utils.DebugLog("RETX request sent for chunk %d (%d missing packets)", chunkID, len(missing))
+				log.Printf("[CLIENT] SUCCESS: RETX request sent for chunk %d (%d missing packets: %v)", chunkID, len(missing), missing)
 			}
 		})
 
-		// Start control client handler - it will wait for connection
-		go func() {
-			for {
-				if ctrlConn != nil {
-					handleControlClient(ctrlConn, rb)
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
+		// Function to attempt RETX connection (defined after rb is created)
+		attemptRetxConnection = func() {
+			if retxEnabled {
+				log.Printf("[CLIENT] RETX: Already connected, skipping connection attempt")
+				return // Already connected
 			}
-		}()
+			log.Printf("[CLIENT] RETX: Attempting TCP connection to %s", clientCtrl)
+			conn, err := net.Dial("tcp", clientCtrl)
+			if err != nil {
+				log.Printf("[CLIENT] ERROR: RETX TCP connection failed: %v", err)
+				return
+			}
+			ctrlConn = conn
+			ctrlEnc = json.NewEncoder(ctrlConn)
+			retxEnabled = true
+			log.Printf("[CLIENT] SUCCESS: RETX TCP connection established to %s", clientCtrl)
+
+			// Start control client handler now that we have a connection
+			log.Printf("[CLIENT] RETX: Starting control client handler goroutine")
+			go handleControlClient(ctrlConn, rb)
+		}
+
+		// Control client handler will be started when RETX connection is established
 
 		go func() {
+			log.Printf("[CLIENT] Starting receiver error handler")
 			for err := range receiver.Errors() {
 				if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("receiver error: %v", err)
+					log.Printf("[CLIENT] Receiver error: %v", err)
 				}
 			}
+			log.Printf("[CLIENT] Receiver error handler exited")
 		}()
 
 		go func() {
@@ -229,7 +241,13 @@ var ClientCmd = &cobra.Command{
 					goto cleanup
 				}
 
-				utils.DebugLog("[CLIENT] Received packet, size: %d bytes", len(packetData))
+				utils.DebugLog("[CLIENT] Received raw packet data, size: %d bytes", len(packetData))
+				utils.DebugLog("[CLIENT] Processing packet in main loop...")
+				if len(packetData) < 36 {
+					log.Printf("[CLIENT] ERROR: Packet too small (%d bytes), minimum header is 36 bytes - DROPPING PACKET", len(packetData))
+					atomic.AddUint64(&utils.GlobalClientStats.LostPackets, 1)
+					continue
+				}
 
 				if !inactivityTimeout.Stop() {
 					<-inactivityTimeout.C
@@ -238,12 +256,17 @@ var ClientCmd = &cobra.Command{
 
 				pkt, err := packet.UnmarshalPacket(packetData)
 				if err != nil {
-					log.Printf("bad packet: %v", err)
+					log.Printf("[CLIENT] ERROR: Bad packet unmarshal error: %v - DROPPING PACKET", err)
+					atomic.AddUint64(&utils.GlobalClientStats.LostPackets, 1)
 					continue
 				}
 
+				utils.DebugLog("[CLIENT] SUCCESS: Unmarshaled packet: chunk=%d, packet=%d, totalPkts=%d, fecType=%d, payload=%d bytes",
+					pkt.ChunkID, pkt.PacketID, pkt.TotalPkts, pkt.FECType, len(pkt.Payload))
+
 				// Skip END markers for statistics
 				if pkt.PacketID == config.EndOfStreamMarker {
+					log.Printf("[CLIENT] INFO: Received END marker for chunk %d", pkt.ChunkID)
 					// Still process END markers for stream completion
 					rb.Add(pkt)
 					continue
@@ -252,16 +275,32 @@ var ClientCmd = &cobra.Command{
 				// Обновление статистики приема
 				atomic.AddUint64(&utils.GlobalClientStats.TotalBytes, uint64(len(pkt.Payload)))
 
+				utils.DebugLog("[CLIENT] Adding packet to reorder buffer: chunk=%d, packet=%d", pkt.ChunkID, pkt.PacketID)
 				rb.Add(pkt)
+				utils.DebugLog("[CLIENT] Packet added to reorder buffer successfully")
 
+				// Mark that we've received the first packet - now safe to attempt RETX connection
+				if !firstPacketReceived {
+					firstPacketReceived = true
+					log.Printf("[CLIENT] INFO: First UDP packet received - RETX connection now allowed")
+				}
+
+				utils.DebugLog("[CLIENT] Checking completion status...")
 				if rb.IsComplete() {
-					log.Println("[CLIENT] Stream completed. Shutting down...")
+					log.Printf("[CLIENT] INFO: Stream completed. Shutting down...")
 					goto cleanup
 				}
+
+				utils.DebugLog("[CLIENT] Loop iteration completed, waiting for next packet...")
+				utils.DebugLog("[CLIENT] Receiver still active: %v", receiver != nil)
+				utils.DebugLog("[CLIENT] About to enter select...")
 
 			case <-rb.GetCompletionNotify():
 				log.Println("[CLIENT] Stream completion notification received. Shutting down...")
 				goto cleanup
+
+			case <-time.After(5 * time.Second):
+				log.Printf("[CLIENT] Still waiting for packets... (inactivity timeout in %d seconds)", 55)
 
 			case <-inactivityTimeout.C:
 				timeoutDuration := 60
@@ -269,7 +308,7 @@ var ClientCmd = &cobra.Command{
 					timeoutDuration = 10
 					initialTimeout = false
 				}
-				log.Printf("[CLIENT] No packets received for %d seconds. Timeout.", timeoutDuration)
+				log.Printf("[CLIENT] INACTIVITY TIMEOUT: No packets received for %d seconds. This indicates the UDP receiver stopped working!", timeoutDuration)
 				goto cleanup
 
 			case <-ctx.Done():
@@ -312,10 +351,10 @@ var ClientCmd = &cobra.Command{
 }
 
 func init() {
-	ClientCmd.Flags().StringVar(&clientAddr, "addr", "239.0.0.1:5000", "UDP source (supports multiple ports: host:port1,port2,port3-port5)")
+	ClientCmd.Flags().StringVar(&clientAddr, "addr", "127.0.0.1:5001", "UDP source (supports multiple ports: host:port1,port2,port3-port5) - use different port than server")
 	ClientCmd.Flags().StringVar(&clientCtrl, "ctrl", "127.0.0.1:6000", "TCP control to server")
 	ClientCmd.Flags().StringVar(&outputFile, "output", "-", "output file ('-' = stdout)")
-	ClientCmd.Flags().IntVar(&retxTimeoutMs, "retx-timeout", 200, "ms to wait before RETX request for oldest incomplete chunk")
+	ClientCmd.Flags().IntVar(&retxTimeoutMs, "retx-timeout", 1000, "ms to wait before RETX request for oldest incomplete chunk (default: 1000ms)")
 	ClientCmd.Flags().BoolVar(&debugMode, "debug", false, "enable debug logging")
 	ClientCmd.Flags().IntVar(&bufferSize, "buffer-size", 128*1024*1024, "disk write buffer size in bytes")
 	ClientCmd.Flags().IntVar(&numWorkers, "workers", 4, "number of async write workers")
@@ -324,33 +363,42 @@ func init() {
 
 // handleControlClient handles incoming RETX packets from server
 func handleControlClient(conn net.Conn, rb *buffer.ReorderBuffer) {
-	utils.DebugLog("[CLIENT] Control client handler started")
+	log.Printf("[CLIENT] RETX: Control client handler started")
 
 	buf := make([]byte, 64*1024) // Large buffer for packets
 
 	for {
+		log.Printf("[CLIENT] RETX: Waiting for RETX packets from server...")
 		n, err := conn.Read(buf)
 		if err != nil {
 			if !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "EOF") {
-				log.Printf("[CLIENT] control read error: %v", err)
+				log.Printf("[CLIENT] ERROR: Control TCP read error: %v", err)
+			} else {
+				log.Printf("[CLIENT] INFO: Control TCP connection closed: %v", err)
 			}
 			return
 		}
 
 		if n == 0 {
+			log.Printf("[CLIENT] RETX: Received 0 bytes, continuing...")
 			continue
 		}
+
+		log.Printf("[CLIENT] RETX: Received %d bytes from server", n)
 
 		// Parse the RETX packet
 		pkt, err := packet.UnmarshalPacket(buf[:n])
 		if err != nil {
-			log.Printf("[CLIENT] failed to unmarshal RETX packet: %v", err)
+			log.Printf("[CLIENT] ERROR: Failed to unmarshal RETX packet: %v", err)
 			continue
 		}
 
-		utils.DebugLog("[CLIENT] received RETX packet: chunk %d, packet %d", pkt.ChunkID, pkt.PacketID)
+		log.Printf("[CLIENT] SUCCESS: Received RETX packet: chunk %d, packet %d (%d bytes payload)", pkt.ChunkID, pkt.PacketID, len(pkt.Payload))
 
 		// Feed the RETX packet to the reorder buffer
+		log.Printf("[CLIENT] RETX: Feeding packet to reorder buffer...")
 		rb.FeedRetxPacket(pkt)
+
+		log.Printf("[CLIENT] SUCCESS: Processed RETX packet for chunk %d", pkt.ChunkID)
 	}
 }

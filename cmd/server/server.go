@@ -96,6 +96,11 @@ var ServerCmd = &cobra.Command{
 		if err != nil {
 			log.Fatalf("failed to parse server address: %v", err)
 		}
+	
+		// Warn about potential localhost conflicts
+		if host == "127.0.0.1" || host == "localhost" {
+			log.Printf("WARNING: Server sending to localhost (%s). Client MUST listen on a DIFFERENT port (not %s) to avoid UDP socket conflicts.", host, strings.Split(serverAddr, ":")[1])
+		}
 
 		// Инициализация статистики
 		serverStats.StartTime = time.Now()
@@ -141,7 +146,7 @@ var ServerCmd = &cobra.Command{
 }
 
 func init() {
-	ServerCmd.Flags().StringVar(&serverAddr, "addr", "239.0.0.1:5000", "UDP destination (supports multiple ports: host:port1,port2,port3-port5)")
+	ServerCmd.Flags().StringVar(&serverAddr, "addr", "127.0.0.1:5000", "UDP destination (supports multiple ports: host:port1,port2,port3-port5) - server sends to this address")
 	ServerCmd.Flags().StringVar(&serverCtrl, "ctrl", ":6000", "TCP control listen address")
 	ServerCmd.Flags().IntVar(&chunkBytes, "chunk-bytes", 1<<20, "bytes per chunk (before split to packets)")
 	ServerCmd.Flags().StringVar(&fecTypeFlag, "fec", "none", "fec type (none|xor|rs)")
@@ -170,11 +175,8 @@ func validateServerParams() error {
 		if fecK <= 0 || fecR < 0 || fecK+fecR > 255 {
 			return fmt.Errorf("invalid RS parameters: k=%d r=%d", fecK, fecR)
 		}
-		// Check if RS shard size fits in packet payload
-		shardSize := (chunkBytes + fecK - 1) / fecK
-		if shardSize > packetPayload {
-			return fmt.Errorf("RS shard size %d exceeds packet payload %d, increase --packet-payload or decrease --fec-k", shardSize, packetPayload)
-		}
+		// Note: RS validation is now done at runtime in the send function
+		// If RS shard size exceeds packet payload, it will fall back to none
 	}
 	if gracePeriodSec < 0 || gracePeriodSec > 3600 {
 		return fmt.Errorf("invalid grace-period: %d (must be 0-3600 seconds)", gracePeriodSec)
@@ -298,17 +300,22 @@ func startFileSenderMulti(host string, ports []int, rb *buffer.RingBuffer, fecTy
 		}
 		copy(data[:n], chunkBuf[:n])
 
-		// Определяем количество data-пакетов на основе размера полезной нагрузки
-		k := int((n + packetPayload - 1) / packetPayload) // Ceiling division
-
 		// Отправляем chunk с выбранным типом FEC через множественные порты
 		switch fecType {
 		case "none":
-			sendChunkNoneMulti(chunkID, data, k, n, rb, sendQ, sender)
+			sendChunkNoneMulti(chunkID, data, n, rb, sendQ, sender)
 		case "xor":
-			sendChunkXORMulti(chunkID, data, k, n, rb, sendQ, sender)
+			sendChunkXORMulti(chunkID, data, n, rb, sendQ, sender)
 		case "rs":
-			sendChunkRSMulti(chunkID, data, fecK, fecR, n, rb, sendQ, rsEnc, sender)
+			// For RS, we need to validate that the chunk can be divided into k shards that fit in packets
+			k := fecK
+			shardSize := (n + k - 1) / k
+			if shardSize > packetPayload {
+				log.Printf("WARNING: RS shard size %d exceeds packet payload %d, falling back to none", shardSize, packetPayload)
+				sendChunkNoneMulti(chunkID, data, n, rb, sendQ, sender)
+			} else {
+				sendChunkRSMulti(chunkID, data, fecK, fecR, n, rb, sendQ, rsEnc, sender)
+			}
 		default:
 			log.Fatalf("unknown fec type: %s", fecType)
 		}
@@ -326,8 +333,10 @@ func startFileSenderMulti(host string, ports []int, rb *buffer.RingBuffer, fecTy
 			break
 		}
 
-		// Removed sleep for maximum throughput - use flow control if needed
-		// time.Sleep(time.Duration(chunkIntervalMs) * time.Millisecond)
+		// Задержка между chunks для предотвращения перегрузки клиента
+		if chunkIntervalMs > 0 {
+			time.Sleep(time.Duration(chunkIntervalMs) * time.Millisecond)
+		}
 	}
 
 	// Правильный graceful shutdown
@@ -339,6 +348,11 @@ func startFileSenderMulti(host string, ports []int, rb *buffer.RingBuffer, fecTy
 	// Используем gracePeriodSec напрямую
 	gracePeriodDuration := time.Duration(gracePeriodSec) * time.Second
 	log.Printf("[SENDER] Grace period: %v. Processing RETX requests...", gracePeriodDuration)
+
+	// Добавляем задержку между chunks для тестирования
+	if chunkIntervalMs > 0 {
+		time.Sleep(time.Duration(chunkIntervalMs) * time.Millisecond)
+	}
 
 	shutdownStart := time.Now()
 	gracefulShutdown := time.NewTimer(gracePeriodDuration)
@@ -418,40 +432,44 @@ func handleControl(c net.Conn, rb *buffer.RingBuffer) {
 
 // handleRETXRequest processes a retransmission request
 func handleRETXRequest(c net.Conn, rb *buffer.RingBuffer, chunkID uint64, missing []uint32) {
-	utils.DebugLog("[RETX] processing request for chunk %d, missing packets: %v", chunkID, missing)
+	log.Printf("[SERVER] RETX: Processing request for chunk %d, missing packets: %v", chunkID, missing)
 
 	// Look up the chunk in the ring buffer
 	chunk, ok := rb.Get(chunkID)
 	if !ok {
-		log.Printf("[RETX] chunk %d not found in ring buffer", chunkID)
+		log.Printf("[SERVER] RETX: Chunk %d not found in ring buffer (may have been evicted)", chunkID)
 		return
 	}
 
+	log.Printf("[SERVER] RETX: Found chunk %d in ring buffer, sending %d packets", chunkID, len(missing))
+
 	// Send each missing packet
+	sentCount := 0
 	for _, packetID := range missing {
 		if int(packetID) >= len(chunk.Packets) {
-			log.Printf("[RETX] invalid packet ID %d for chunk %d", packetID, chunkID)
+			log.Printf("[SERVER] RETX: Invalid packet ID %d for chunk %d (max: %d)", packetID, chunkID, len(chunk.Packets)-1)
 			continue
 		}
 
 		pbuf := chunk.Packets[packetID]
 		if pbuf == nil {
-			log.Printf("[RETX] packet %d not available in chunk %d", packetID, chunkID)
+			log.Printf("[SERVER] RETX: Packet %d not available in chunk %d", packetID, chunkID)
 			continue
 		}
 
 		// Send the packet data back to client
 		data := pbuf.Bytes()
 		if _, err := c.Write(data); err != nil {
-			log.Printf("[RETX] failed to send packet %d for chunk %d: %v", packetID, chunkID, err)
+			log.Printf("[SERVER] RETX: Failed to send packet %d for chunk %d: %v", packetID, chunkID, err)
 			return
 		}
 
-		utils.DebugLog("[RETX] sent packet %d for chunk %d", packetID, chunkID)
+		log.Printf("[SERVER] RETX: Sent packet %d for chunk %d (%d bytes)", packetID, chunkID, len(data))
 		atomic.AddUint64(&serverStats.RetxRequests, 1)
+		sentCount++
 	}
 
-	utils.DebugLog("[RETX] completed request for chunk %d", chunkID)
+	log.Printf("[SERVER] RETX: Completed request for chunk %d, sent %d/%d packets", chunkID, sentCount, len(missing))
 }
 
 // sendWorkerStd sends packets using standard UDP
@@ -537,14 +555,14 @@ func sendEndMarker(totalChunks uint64, rb *buffer.RingBuffer, sendQ chan<- *buff
 }
 
 // sendChunkNoneMulti sends chunk without FEC
-func sendChunkNoneMulti(chunkID uint64, data []byte, k, n int, rb *buffer.RingBuffer, sendQ chan<- *buffer.PBuf, sender *udp.MultiUDPSender) {
-	total := k
+func sendChunkNoneMulti(chunkID uint64, data []byte, n int, rb *buffer.RingBuffer, sendQ chan<- *buffer.PBuf, sender *udp.MultiUDPSender) {
+	// Calculate number of packets needed based on packetPayload limit
+	total := (n + packetPayload - 1) / packetPayload // Ceiling division
 	ch := &buffer.Chunk{ID: chunkID, Timestamp: time.Now(), PktCnt: total, Packets: make([]*buffer.PBuf, total)}
-	per := (n + k - 1) / k // Ceiling division for packet size
 
-	for i := 0; i < k; i++ {
-		start := i * per
-		end := start + per
+	for i := 0; i < total; i++ {
+		start := i * packetPayload
+		end := start + packetPayload
 		if end > n {
 			end = n
 		}
@@ -559,10 +577,10 @@ func sendChunkNoneMulti(chunkID uint64, data []byte, k, n int, rb *buffer.RingBu
 			ChunkBytes: uint32(n),
 			Version:    config.HeaderVersion,
 			FECType:    config.FECNone,
-			K:          uint16(k),
+			K:          uint16(total), // All packets are data packets
 			R:          0,
 			ShardSize:  uint32(len(shard)),
-			DataPkts:   uint32(k),
+			DataPkts:   uint32(total),
 			Payload:    shard,
 		}
 		enqueuePacketMulti(pkt, ch, sendQ)
@@ -571,7 +589,9 @@ func sendChunkNoneMulti(chunkID uint64, data []byte, k, n int, rb *buffer.RingBu
 }
 
 // sendChunkXORMulti sends chunk with XOR FEC
-func sendChunkXORMulti(chunkID uint64, data []byte, k, n int, rb *buffer.RingBuffer, sendQ chan<- *buffer.PBuf, sender *udp.MultiUDPSender) {
+func sendChunkXORMulti(chunkID uint64, data []byte, n int, rb *buffer.RingBuffer, sendQ chan<- *buffer.PBuf, sender *udp.MultiUDPSender) {
+	// Calculate number of data packets based on packetPayload
+	k := (n + packetPayload - 1) / packetPayload // Ceiling division
 	total := k + 1
 	ch := &buffer.Chunk{ID: chunkID, Timestamp: time.Now(), PktCnt: total, Packets: make([]*buffer.PBuf, total)}
 	per := packetPayload
@@ -613,7 +633,7 @@ func sendChunkXORMulti(chunkID uint64, data []byte, k, n int, rb *buffer.RingBuf
 				FECType:    config.FECXOR,
 				K:          uint16(k),
 				R:          1,
-				ShardSize:  uint32(per),
+				ShardSize:  uint32(len(shard)),
 				DataPkts:   uint32(k),
 				Payload:    shard,
 			}
@@ -633,7 +653,7 @@ func sendChunkXORMulti(chunkID uint64, data []byte, k, n int, rb *buffer.RingBuf
 		FECType:    config.FECXOR,
 		K:          uint16(k),
 		R:          1,
-		ShardSize:  uint32(per),
+		ShardSize:  uint32(len(parity)),
 		DataPkts:   uint32(k),
 		Payload:    parity,
 	}

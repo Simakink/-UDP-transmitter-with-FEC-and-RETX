@@ -138,17 +138,19 @@ func NewMultiUDPReceiver(host string, ports []int, bufferSize int) (*MultiUDPRec
 			return nil, fmt.Errorf("listen UDP %s: %v", addr, err)
 		}
 
-		// Включаем SO_REUSEPORT для лучшей производительности
-		if file, err := conn.File(); err == nil {
-			fd := int(file.Fd())
-			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-				log.Printf("failed to set SO_REUSEPORT on %s: %v", addr, err)
+		// Включаем SO_REUSEPORT только для multicast
+		if udpAddr.IP.IsMulticast() {
+			if file, err := conn.File(); err == nil {
+				fd := int(file.Fd())
+				if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+					log.Printf("failed to set SO_REUSEPORT on %s: %v", addr, err)
+				}
+				file.Close()
 			}
-			file.Close()
 		}
 
-		// Увеличиваем буфер приема
-		if err := conn.SetReadBuffer(16 << 20); err != nil {
+		// Увеличиваем буфер приема до 64MB для лучшей производительности
+		if err := conn.SetReadBuffer(64 << 20); err != nil {
 			log.Printf("failed to set read buffer for %s: %v", addr, err)
 		}
 
@@ -184,35 +186,17 @@ func (mr *MultiUDPReceiver) readLoop(connID int, conn *net.UDPConn) {
 
 	utils.DebugLog("readLoop %d started", connID)
 
-	// Устанавливаем начальный deadline
-	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-
 	for {
-		// ✅ НОВОЕ: Проверяем контекст перед каждым чтением
-		select {
-		case <-mr.ctx.Done():
-			utils.DebugLog("readLoop %d: context cancelled, exiting gracefully", connID)
-			return
-		default:
-		}
-
-		n, _, err := conn.ReadFromUDP(buf)
+		// Читаем пакеты в плотном цикле для максимальной производительности
+		utils.DebugLog("readLoop %d: waiting for UDP packet...", connID)
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			// ✅ НОВОЕ: Проверяем контекст при ошибке
+			// Проверяем контекст при ошибке
 			select {
 			case <-mr.ctx.Done():
 				utils.DebugLog("readLoop %d: context cancelled on error, exiting", connID)
 				return
 			default:
-			}
-
-			// Обрабатываем timeout ошибки
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// ✅ ИСПРАВЛЕНО: Обновляем deadline только если контекст не отменен
-				if mr.ctx.Err() == nil {
-					conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-				}
-				continue
 			}
 
 			// Проверяем не закрыто ли соединение
@@ -226,19 +210,16 @@ func (mr *MultiUDPReceiver) readLoop(connID int, conn *net.UDPConn) {
 			return
 		}
 
-		// ✅ ИСПРАВЛЕНО: Обновляем deadline только если не завершаемся
-		if mr.ctx.Err() == nil {
-			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		}
+		utils.DebugLog("readLoop %d: received UDP packet from %v, size %d", connID, remoteAddr, n)
 
 		// Создаем копию данных для безопасной передачи
 		packetData := make([]byte, n)
 		copy(packetData, buf[:n])
 
-		// ✅ НОВОЕ: Отправляем пакет с учетом контекста
+		// Отправляем пакет с учетом контекста
 		select {
 		case mr.packets <- packetData:
-			// Успешно отправлено
+			utils.DebugLog("readLoop %d: sent packet to channel", connID)
 		case <-mr.ctx.Done():
 			utils.DebugLog("readLoop %d: context cancelled while sending packet", connID)
 			return
